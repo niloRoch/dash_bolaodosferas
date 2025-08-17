@@ -9,6 +9,7 @@ from io import StringIO
 import datetime
 from collections import Counter
 import math
+import time
 
 # Configuração da página
 st.set_page_config(
@@ -257,31 +258,130 @@ def get_centro_numbers():
     """Retorna os números do centro do cartão"""
     return [7, 8, 9, 12, 13, 14, 17, 18, 19]
 
-@st.cache_data(ttl=300)
-def load_google_sheets_data(sheet_url):
-    """Carrega dados do Google Sheets"""
+def extract_sheet_and_gid_from_url(url):
+    """Extrai sheet_id e gid da URL do Google Sheets"""
     try:
-        sheet_id = sheet_url.split('/d/')[1].split('/')[0]
-        csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid=674877581"
-        
-        response = requests.get(csv_url)
-        if response.status_code == 200:
-            df = pd.read_csv(StringIO(response.text))
-            return df
+        # Extrai o sheet_id
+        if '/d/' in url:
+            sheet_id = url.split('/d/')[1].split('/')[0]
         else:
-            st.error(f"Erro ao carregar dados: Status {response.status_code}")
-            return None
+            st.error("❌ URL inválida. Use uma URL do Google Sheets.")
+            return None, None
+            
+        # Extrai o gid se presente
+        gid = '0'  # valor padrão
+        if 'gid=' in url:
+            gid = url.split('gid=')[1].split('&')[0].split('#')[0]
+        elif '#gid=' in url:
+            gid = url.split('#gid=')[1].split('&')[0]
+            
+        return sheet_id, gid
     except Exception as e:
-        st.error(f"Erro ao conectar com Google Sheets: {str(e)}")
+        st.error(f"❌ Erro ao processar URL: {str(e)}")
+        return None, None
+
+@st.cache_data(ttl=60, show_spinner=True)  # Cache mais curto para testes
+def load_google_sheets_data(sheet_url):
+    """Carrega dados do Google Sheets com melhor tratamento de erros"""
+    if not sheet_url or sheet_url.strip() == "":
+        st.warning("⚠️ URL do Google Sheets não fornecida")
+        return create_sample_data()
+    
+    try:
+        sheet_id, gid = extract_sheet_and_gid_from_url(sheet_url)
+        if not sheet_id:
+            return create_sample_data()
+            
+        # Tenta diferentes formatos de URL
+        urls_to_try = [
+            f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}",
+            f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv",
+            f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&gid={gid}"
+        ]
+        
+        for i, csv_url in enumerate(urls_to_try):
+            try:
+                st.info(f"🔄 Tentativa {i+1}: Carregando dados da planilha...")
+                
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                }
+                
+                response = requests.get(csv_url, headers=headers, timeout=30)
+                
+                if response.status_code == 200:
+                    # Verifica se a resposta não está vazia
+                    if len(response.text.strip()) == 0:
+                        st.warning(f"⚠️ Resposta vazia da URL {i+1}")
+                        continue
+                    
+                    # Tenta decodificar diferentes encodings
+                    try:
+                        content = response.content.decode('utf-8')
+                    except UnicodeDecodeError:
+                        try:
+                            content = response.content.decode('latin-1')
+                        except UnicodeDecodeError:
+                            content = response.content.decode('utf-8', errors='ignore')
+                    
+                    df = pd.read_csv(StringIO(content))
+                    
+                    # Verifica se o DataFrame não está vazio
+                    if df.empty:
+                        st.warning(f"⚠️ Planilha vazia na tentativa {i+1}")
+                        continue
+                    
+                    # Verifica se tem as colunas esperadas
+                    expected_columns = ['CONCURSO'] + [f'BOLA {j}' for j in range(1, 16)]
+                    missing_columns = [col for col in expected_columns if col not in df.columns]
+                    
+                    if missing_columns:
+                        st.warning(f"⚠️ Colunas faltando: {missing_columns}")
+                        # Tenta usar as primeiras colunas disponíveis
+                        if len(df.columns) >= 16:
+                            st.info("🔄 Tentando usar as primeiras 16 colunas...")
+                            df.columns = expected_columns[:len(df.columns)]
+                    
+                    st.success(f"✅ Dados carregados com sucesso! {len(df)} registros encontrados")
+                    st.info(f"📊 Colunas encontradas: {list(df.columns)}")
+                    
+                    # Mostra uma prévia dos dados
+                    if len(df) > 0:
+                        st.info(f"🎯 Último concurso: {df.iloc[-1]['CONCURSO'] if 'CONCURSO' in df.columns else 'N/A'}")
+                    
+                    return df
+                else:
+                    st.warning(f"⚠️ Status HTTP {response.status_code} na tentativa {i+1}")
+                    
+            except requests.exceptions.Timeout:
+                st.error(f"⏱️ Timeout na tentativa {i+1}")
+            except requests.exceptions.RequestException as e:
+                st.error(f"🌐 Erro de conexão na tentativa {i+1}: {str(e)}")
+            except Exception as e:
+                st.error(f"❌ Erro inesperado na tentativa {i+1}: {str(e)}")
+        
+        # Se todas as tentativas falharam
+        st.error("❌ Não foi possível carregar os dados de nenhuma URL")
+        st.info("📝 Verifique se:")
+        st.info("1. A planilha está compartilhada publicamente")
+        st.info("2. A URL está correta")
+        st.info("3. A planilha não está vazia")
+        st.info("4. Você tem conexão com a internet")
+        
+        return create_sample_data()
+        
+    except Exception as e:
+        st.error(f"❌ Erro geral ao carregar dados: {str(e)}")
         return create_sample_data()
 
 def create_sample_data():
     """Cria dados de exemplo baseados no CSV fornecido"""
+    st.info("📋 Usando dados de exemplo")
     data = {
-        'CONCURSO': [3470],
-        'BOLA 1': [1], 'BOLA 2': [4], 'BOLA 3': [5], 'BOLA 4': [7], 'BOLA 5': [8],
-        'BOLA 6': [10], 'BOLA 7': [12], 'BOLA 8': [13], 'BOLA 9': [14], 'BOLA 10': [18],
-        'BOLA 11': [20], 'BOLA 12': [21], 'BOLA 13': [22], 'BOLA 14': [23], 'BOLA 15': [24]
+        'CONCURSO': [3470, 3471, 3472],
+        'BOLA 1': [1, 2, 3], 'BOLA 2': [4, 5, 6], 'BOLA 3': [5, 7, 8], 'BOLA 4': [7, 9, 10], 'BOLA 5': [8, 11, 12],
+        'BOLA 6': [10, 13, 14], 'BOLA 7': [12, 15, 16], 'BOLA 8': [13, 17, 18], 'BOLA 9': [14, 19, 20], 'BOLA 10': [18, 21, 22],
+        'BOLA 11': [20, 23, 24], 'BOLA 12': [21, 25, 1], 'BOLA 13': [22, 2, 3], 'BOLA 14': [23, 4, 5], 'BOLA 15': [24, 6, 7]
     }
     return pd.DataFrame(data)
 
@@ -430,6 +530,34 @@ def create_modern_chart(data, chart_type, title, color_scheme=None):
     
     return fig
 
+def process_sheet_data(df):
+    """Processa os dados da planilha para extrair o último sorteio"""
+    try:
+        if df is None or df.empty:
+            return None
+        
+        # Pega a última linha (último sorteio)
+        last_row = df.iloc[-1]
+        
+        # Extrai os números das colunas BOLA 1 a BOLA 15
+        numbers = []
+        for i in range(1, 16):
+            col_name = f'BOLA {i}'
+            if col_name in df.columns:
+                num = last_row[col_name]
+                if pd.notna(num):
+                    numbers.append(int(num))
+        
+        concurso = last_row.get('CONCURSO', 'N/A')
+        
+        return {
+            'concurso': concurso,
+            'numeros': sorted(numbers)
+        }
+    except Exception as e:
+        st.error(f"❌ Erro ao processar dados da planilha: {str(e)}")
+        return None
+
 def main():
     # Cabeçalho moderno
     st.markdown("""
@@ -449,15 +577,35 @@ def main():
         </div>
         """, unsafe_allow_html=True)
         
+        # Status da conexão
+        st.markdown("### 🔗 STATUS DA PLANILHA")
+        
         sheet_url = st.text_input(
-            "🔗 URL do Google Sheets:",
+            "URL do Google Sheets:",
             value="https://docs.google.com/spreadsheets/d/1tJynBjtlHAEiytXug9HdbRS8rKsKYxopqQSjFXNE9Y0/edit?gid=674877581#gid=674877581",
             help="Cole aqui a URL da sua planilha do Google Sheets"
         )
         
-        if st.button("🔄 Atualizar Dados"):
-            st.cache_data.clear()
-            st.rerun()
+        # Botões de controle
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔄 Atualizar", use_container_width=True):
+                st.cache_data.clear()
+                st.rerun()
+        
+        with col2:
+            if st.button("🧹 Limpar Cache", use_container_width=True):
+                st.cache_data.clear()
+                st.success("Cache limpo!")
+        
+        # Configurações de debug
+        st.markdown("---")
+        debug_mode = st.checkbox("🐛 Modo Debug", help="Mostra informações detalhadas de carregamento")
+        auto_refresh = st.selectbox(
+            "🔄 Auto-atualização:",
+            ["Manual", "30 segundos", "1 minuto", "5 minutos"],
+            help="Atualização automática dos dados"
+        )
         
         st.markdown("---")
         
@@ -467,24 +615,69 @@ def main():
             "Selecione a visualização:",
             ["🏠 Dashboard Principal", "📈 Estatísticas dos Sorteios", "📋 Histórico & Relatórios"]
         )
+        
+        # Informações da planilha
+        st.markdown("---")
+        st.markdown("### ℹ️ INFORMAÇÕES")
+        st.info("📝 **Dicas para resolver problemas:**")
+        st.info("1. Verifique se a planilha está pública")
+        st.info("2. Teste a URL no navegador")
+        st.info("3. Use 'Limpar Cache' se necessário")
+        st.info("4. Ative o 'Modo Debug' para mais detalhes")
     
-    # Carregamento de dados
-    df = load_google_sheets_data(sheet_url) if sheet_url else create_sample_data()
+    # Auto-refresh logic
+    if auto_refresh != "Manual":
+        refresh_intervals = {
+            "30 segundos": 30,
+            "1 minuto": 60,
+            "5 minutos": 300
+        }
+        time.sleep(refresh_intervals.get(auto_refresh, 60))
+        st.rerun()
+    
+    # Carregamento de dados com debug
+    if debug_mode:
+        st.markdown("### 🐛 DEBUG MODE")
+        with st.expander("Informações de Debug", expanded=True):
+            st.write(f"**URL fornecida:** {sheet_url}")
+            if sheet_url:
+                sheet_id, gid = extract_sheet_and_gid_from_url(sheet_url)
+                st.write(f"**Sheet ID:** {sheet_id}")
+                st.write(f"**GID:** {gid}")
+                st.write(f"**Timestamp:** {datetime.datetime.now()}")
+    
+    # Carregamento dos dados
+    with st.spinner("🔄 Carregando dados da planilha..."):
+        df = load_google_sheets_data(sheet_url) if sheet_url else create_sample_data()
+    
+    # Processa os dados da planilha
+    sheet_data = process_sheet_data(df)
+    
+    # Define os números do último sorteio
+    if sheet_data and sheet_data['numeros']:
+        winning_numbers = sheet_data['numeros']
+        ultimo_concurso = sheet_data['concurso']
+        st.success(f"✅ Dados atualizados! Último concurso: {ultimo_concurso}")
+    else:
+        winning_numbers = [1, 4, 5, 7, 8, 10, 12, 13, 14, 18, 20, 21, 22, 23, 24]
+        ultimo_concurso = 3470
+        st.warning("⚠️ Usando dados de exemplo")
+    
+    # Dados auxiliares
     games_df = create_sample_games()
     historical_df = create_sample_historical_data()
     conjunto_18 = get_conjunto_18_dezenas()
-    winning_numbers = [1, 4, 5, 7, 8, 10, 12, 13, 14, 18, 20, 21, 22, 23, 24]
     
     if df is not None:
         if view_mode == "🏠 Dashboard Principal":
-            # Métricas principais com design 
+            # Métricas principais com design moderno
             col1, col2, col3, col4 = st.columns(4)
             
             with col1:
                 st.markdown(f"""
                 <div class="metric-card">
                     <h3>🎮 JOGOS REALIZADOS</h3>
-                    <h1 style=""font-size: 2.5rem; margin: 0.5rem 0; color: #ffffff; text-shadow: 1px 1px 4px rgba(0,0,0,0.5);">{len(games_df)}</h1>
+                    <h1 style="font-size: 2.5rem; margin: 0.5rem 0; color: #ffffff; text-shadow: 1px 1px 4px rgba(0,0,0,0.5);">{len(games_df)}</h1>
                     <p style="opacity: 0.8;">Total de apostas</p>
                 </div>
                 """, unsafe_allow_html=True)
@@ -494,7 +687,7 @@ def main():
                 st.markdown(f"""
                 <div class="metric-card">
                     <h3>🎯 ACERTOS TOTAIS</h3>
-                    <h1 style=""font-size: 2.5rem; margin: 0.5rem 0; color: #ffffff; text-shadow: 1px 1px 4px rgba(0,0,0,0.5);">{total_acertos}</h1>
+                    <h1 style="font-size: 2.5rem; margin: 0.5rem 0; color: #ffffff; text-shadow: 1px 1px 4px rgba(0,0,0,0.5);">{total_acertos}</h1>
                     <p style="opacity: 0.8;">Números acertados</p>
                 </div>
                 """, unsafe_allow_html=True)
@@ -504,7 +697,7 @@ def main():
                 st.markdown(f"""
                 <div class="metric-card">
                     <h3>📊 MÉDIA DE ACERTOS</h3>
-                    <h1 style=""font-size: 2.5rem; margin: 0.5rem 0; color: #ffffff; text-shadow: 1px 1px 4px rgba(0,0,0,0.5);">{media_acertos:.1f}</h1>
+                    <h1 style="font-size: 2.5rem; margin: 0.5rem 0; color: #ffffff; text-shadow: 1px 1px 4px rgba(0,0,0,0.5);">{media_acertos:.1f}</h1>
                     <p style="opacity: 0.8;">Por jogo</p>
                 </div>
                 """, unsafe_allow_html=True)
@@ -514,15 +707,21 @@ def main():
                 st.markdown(f"""
                 <div class="metric-card">
                     <h3>🏆 MELHOR RESULTADO</h3>
-                    <h1 style=""font-size: 2.5rem; margin: 0.5rem 0; color: #ffffff; text-shadow: 1px 1px 4px rgba(0,0,0,0.5);">{max_acertos}</h1>
+                    <h1 style="font-size: 2.5rem; margin: 0.5rem 0; color: #ffffff; text-shadow: 1px 1px 4px rgba(0,0,0,0.5);">{max_acertos}</h1>
                     <p style="opacity: 0.8;">Máximo de acertos</p>
                 </div>
                 """, unsafe_allow_html=True)
             
             # Último sorteio destacado
             st.markdown('<div class="content-card">', unsafe_allow_html=True)
-            st.markdown("### 🎲 ÚLTIMO SORTEIO - CONCURSO 3470")
+            st.markdown(f"### 🎲 ÚLTIMO SORTEIO - CONCURSO {ultimo_concurso}")
             st.markdown(display_numbers_as_balls(winning_numbers, title="Números Sorteados"), unsafe_allow_html=True)
+            
+            # Mostrar dados brutos se em modo debug
+            if debug_mode and sheet_data:
+                st.markdown("**Debug - Dados processados:**")
+                st.json(sheet_data)
+            
             st.markdown('</div>', unsafe_allow_html=True)
             
             # Análise detalhada dos jogos
@@ -531,7 +730,7 @@ def main():
             st.markdown("### 🎮 ANÁLISE DETALHADA DOS JOGOS")
             
             for _, game in games_df.iterrows():
-                with st.expander(f"🎯 Jogo #{game['JOGO']} - {game['ACERTOS']} acertos", expanded=False):
+                with st.expander(f"🎯 Jogo #{game['JOGO']} - {len([n for n in game['NUMEROS'] if n in winning_numbers])} acertos", expanded=False):
                     col1, col2 = st.columns([3, 1])
                     
                     with col1:
@@ -548,8 +747,9 @@ def main():
                     
                     with col2:
                         st.markdown('<div class="metric-card" style="margin: 0;">', unsafe_allow_html=True)
-                        st.metric("Acertos", game['ACERTOS'])
-                        st.metric("Taxa", f"{(game['ACERTOS']/15)*100:.1f}%")
+                        acertos_reais = len([n for n in game['NUMEROS'] if n in winning_numbers])
+                        st.metric("Acertos", acertos_reais)
+                        st.metric("Taxa", f"{(acertos_reais/15)*100:.1f}%")
                         
                         # Estatísticas do jogo
                         pares = len([n for n in game['NUMEROS'] if n % 2 == 0])
@@ -584,13 +784,18 @@ def main():
             col1, col2 = st.columns(2)
             
             with col1:
-                # Gráfico de acertos por jogo
+                # Gráfico de acertos por jogo (recalculado com dados reais)
+                games_display = games_df.copy()
+                games_display['ACERTOS_REAIS'] = games_display['NUMEROS'].apply(
+                    lambda x: len([n for n in x if n in winning_numbers])
+                )
+                
                 fig_acertos = px.bar(
-                    games_df,
+                    games_display,
                     x='JOGO',
-                    y='ACERTOS',
-                    title='🎯 Acertos por Jogo',
-                    color='ACERTOS',
+                    y='ACERTOS_REAIS',
+                    title='🎯 Acertos por Jogo (Dados Atualizados)',
+                    color='ACERTOS_REAIS',
                     color_continuous_scale=['#663399', '#9966cc', '#ffd700']
                 )
                 fig_acertos.update_layout(
@@ -603,7 +808,7 @@ def main():
             
             with col2:
                 # Distribuição de acertos
-                acertos_dist = games_df['ACERTOS'].value_counts().sort_index()
+                acertos_dist = games_display['ACERTOS_REAIS'].value_counts().sort_index()
                 fig_dist = px.pie(
                     values=acertos_dist.values,
                     names=acertos_dist.index,
@@ -621,6 +826,12 @@ def main():
         elif view_mode == "📈 Estatísticas dos Sorteios":
             st.markdown('<div class="content-card">', unsafe_allow_html=True)
             st.markdown("## 📈 ESTATÍSTICAS DOS SORTEIOS HISTÓRICOS")
+            
+            # Mostrar dados da planilha se disponível
+            if not df.empty:
+                st.markdown("### 📊 DADOS DA PLANILHA")
+                st.dataframe(df.head(10), use_container_width=True)
+            
             st.markdown('</div>', unsafe_allow_html=True)
             
             # Estatísticas históricas
@@ -690,302 +901,39 @@ def main():
                 title_font=dict(color='white')
             )
             st.plotly_chart(fig_freq, use_container_width=True)
-            
-            # Top números mais e menos sorteados
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.markdown("#### 🔥 NÚMEROS MAIS SORTEADOS")
-                top_numeros = freq_data.nlargest(5, 'Frequencia')
-                for _, row in top_numeros.iterrows():
-                    st.markdown(f"""
-                    <div class="stat-item">
-                        <span class="highlight-number">{int(row['Numero']):02d}</span> 
-                        <strong>{int(row['Frequencia'])} vezes</strong>
-                    </div>
-                    """, unsafe_allow_html=True)
-            
-            with col2:
-                st.markdown("#### ❄️ NÚMEROS MENOS SORTEADOS")
-                bottom_numeros = freq_data.nsmallest(5, 'Frequencia')
-                for _, row in bottom_numeros.iterrows():
-                    st.markdown(f"""
-                    <div class="stat-item">
-                        <span class="highlight-number">{int(row['Numero']):02d}</span> 
-                        <strong>{int(row['Frequencia'])} vezes</strong>
-                    </div>
-                    """, unsafe_allow_html=True)
-            
             st.markdown('</div>', unsafe_allow_html=True)
-            
-            # Estatísticas por concurso
-            st.markdown('<div class="content-card">', unsafe_allow_html=True)
-            st.markdown("### 📊 ANÁLISE DETALHADA POR CONCURSO")
-            
-            # Mostrar tabela dos últimos concursos
-            concursos_display = historical_stats['concursos'].copy()
-            st.dataframe(
-                concursos_display[['CONCURSO', 'PARES', 'IMPARES', 'PRIMOS', 'FIBONACCI', 'MOLDURA', 'CENTRO', 'SOMA', 'AMPLITUDE']],
-                use_container_width=True,
-                height=400
-            )
-            st.markdown('</div>', unsafe_allow_html=True)
-            
-            # Gráficos de tendências
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                # Evolução da soma
-                fig_soma = px.line(
-                    concursos_display,
-                    x='CONCURSO',
-                    y='SOMA',
-                    title='Evolução da Soma por Concurso',
-                    markers=True,
-                    color_discrete_sequence=['#ffd700']
-                )
-                fig_soma.update_layout(
-                    plot_bgcolor='rgba(0,0,0,0)',
-                    paper_bgcolor='rgba(0,0,0,0)',
-                    font=dict(color='white'),
-                    title_font=dict(color='white')
-                )
-                st.plotly_chart(fig_soma, use_container_width=True)
-            
-            with col2:
-                # Comparação Pares vs Ímpares
-                fig_par_impar = px.bar(
-                    concursos_display,
-                    x='CONCURSO',
-                    y=['PARES', 'IMPARES'],
-                    title='Pares vs Ímpares por Concurso',
-                    color_discrete_sequence=['#663399', '#ffd700']
-                )
-                fig_par_impar.update_layout(
-                    plot_bgcolor='rgba(0,0,0,0)',
-                    paper_bgcolor='rgba(0,0,0,0)',
-                    font=dict(color='white'),
-                    title_font=dict(color='white')
-                )
-                st.plotly_chart(fig_par_impar, use_container_width=True)
         
         elif view_mode == "📋 Histórico & Relatórios":
             st.markdown('<div class="content-card">', unsafe_allow_html=True)
             st.markdown("## 📋 HISTÓRICO DE RESULTADOS E RELATÓRIOS")
-            st.markdown('</div>', unsafe_allow_html=True)
             
-            # Resumo executivo
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                jogos_11_mais = len(games_df[games_df['ACERTOS'] >= 11])
-                st.markdown(f"""
-                <div class="metric-card">
-                    <h3>🏆 11+ ACERTOS</h3>
-                    <h2>{jogos_11_mais}</h2>
-                    <p>jogos premiados</p>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            with col2:
-                jogos_8_10 = len(games_df[(games_df['ACERTOS'] >= 8) & (games_df['ACERTOS'] <= 10)])
-                st.markdown(f"""
-                <div class="metric-card">
-                    <h3>🎯 8-10 ACERTOS</h3>
-                    <h2>{jogos_8_10}</h2>
-                    <p>jogos regulares</p>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            with col3:
-                jogos_baixo = len(games_df[games_df['ACERTOS'] < 8])
-                st.markdown(f"""
-                <div class="metric-card">
-                    <h3>⭐ <8 ACERTOS</h3>
-                    <h2>{jogos_baixo}</h2>
-                    <p>jogos baixos</p>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            with col4:
-                taxa_sucesso = (jogos_11_mais / len(games_df)) * 100 if len(games_df) > 0 else 0
-                st.markdown(f"""
-                <div class="metric-card">
-                    <h3>📈 TAXA SUCESSO</h3>
-                    <h2>{taxa_sucesso:.1f}%</h2>
-                    <p>jogos 11+</p>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            # Tabela detalhada
-            st.markdown("### 📊 TABELA COMPLETA DE JOGOS")
-            
-            # Preparar dados para exibição
-            games_display = games_df.copy()
-            games_display['NUMEROS_STR'] = games_display['NUMEROS'].apply(
-                lambda x: ' - '.join([f"{n:02d}" for n in sorted(x)])
-            )
-            games_display['ACERTOS_COM_SORTEIO'] = games_display['NUMEROS'].apply(
-                lambda x: len([n for n in x if n in winning_numbers])
-            )
-            games_display['TAXA_ACERTO'] = (games_display['ACERTOS_COM_SORTEIO'] / 15 * 100).round(1)
-            
-            # Status baseado nos acertos
-            def get_status(acertos):
-                if acertos >= 11:
-                    return "🏆 Premiado"
-                elif acertos >= 8:
-                    return "🎯 Regular"
-                else:
-                    return "⭐ Baixo"
-            
-            games_display['STATUS'] = games_display['ACERTOS_COM_SORTEIO'].apply(get_status)
-            
-            st.dataframe(
-                games_display[['JOGO', 'NUMEROS_STR', 'ACERTOS_COM_SORTEIO', 'TAXA_ACERTO', 'STATUS']].rename(columns={
-                    'JOGO': '🎮 Jogo',
-                    'NUMEROS_STR': '🔢 Números',
-                    'ACERTOS_COM_SORTEIO': '🎯 Acertos',
-                    'TAXA_ACERTO': '📊 Taxa (%)',
-                    'STATUS': '🏆 Status'
-                }),
-                use_container_width=True,
-                height=400
-            )
-            
-            # Análise temporal (simulada)
-            st.markdown("---")
-            st.markdown("### 📈 EVOLUÇÃO DOS RESULTADOS")
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                # Gráfico de linha dos acertos
-                fig_evolucao = px.line(
-                    games_df,
-                    x='JOGO',
-                    y='ACERTOS',
-                    title='Evolução dos Acertos por Jogo',
-                    markers=True,
-                    color_discrete_sequence=['#ffd700']
-                )
-                fig_evolucao.add_hline(y=games_df['ACERTOS'].mean(), line_dash="dash", 
-                                      line_color="#663399", annotation_text="Média")
-                fig_evolucao.update_layout(
-                    plot_bgcolor='rgba(0,0,0,0)',
-                    paper_bgcolor='rgba(0,0,0,0)',
-                    font=dict(color='white'),
-                    title_font=dict(color='white')
-                )
-                st.plotly_chart(fig_evolucao, use_container_width=True)
-            
-            with col2:
-                # Distribuição por faixas de acerto
-                faixas = ['0-7', '8-10', '11-15']
-                valores = [
-                    len(games_df[games_df['ACERTOS'] <= 7]),
-                    len(games_df[(games_df['ACERTOS'] >= 8) & (games_df['ACERTOS'] <= 10)]),
-                    len(games_df[games_df['ACERTOS'] >= 11])
-                ]
+            # Mostrar dados brutos da planilha
+            if not df.empty:
+                st.markdown("### 📈 DADOS BRUTOS DA PLANILHA")
+                st.dataframe(df, use_container_width=True, height=300)
                 
-                fig_faixas = px.bar(
-                    x=faixas,
-                    y=valores,
-                    title='Distribuição por Faixas de Acerto',
-                    color=valores,
-                    color_continuous_scale=['#663399', '#9966cc', '#ffd700']
-                )
-                fig_faixas.update_layout(
-                    plot_bgcolor='rgba(0,0,0,0)',
-                    paper_bgcolor='rgba(0,0,0,0)',
-                    font=dict(color='white'),
-                    title_font=dict(color='white')
-                )
-                st.plotly_chart(fig_faixas, use_container_width=True)
-            
-            # Relatório de insights
-            st.markdown("---")
-            st.markdown('<div class="game-card">', unsafe_allow_html=True)
-            st.markdown("### 🧠 INSIGHTS E RECOMENDAÇÕES")
-            
-            insights = []
-            
-            # Análise da estratégia atual
-            melhor_jogo = games_df.loc[games_df['ACERTOS'].idxmax()]
-            insights.append(f"🏆 **Melhor jogo:** #{melhor_jogo['JOGO']} com {melhor_jogo['ACERTOS']} acertos")
-            
-            # Análise de números mais/menos jogados
-            all_numbers = []
-            for _, game in games_df.iterrows():
-                all_numbers.extend(game['NUMEROS'])
-            frequency = Counter(all_numbers)
-            mais_jogado = max(frequency, key=frequency.get)
-            menos_jogado = min(frequency, key=frequency.get)
-            insights.append(f"🔥 **Número mais jogado:** {mais_jogado:02d} ({frequency[mais_jogado]} vezes)")
-            insights.append(f"❄️ **Número menos jogado:** {menos_jogado:02d} ({frequency[menos_jogado]} vezes)")
-            
-            # Taxa de sucesso
-            taxa_11_mais = (len(games_df[games_df['ACERTOS'] >= 11]) / len(games_df)) * 100
-            insights.append(f"📊 **Taxa de jogos premiados (11+):** {taxa_11_mais:.1f}%")
-            
-            # Comparação com estatísticas dos sorteios
-            stats = calculate_advanced_stats(games_df, winning_numbers)
-            if 'pares_sorteio' in stats:
-                insights.append(f"⚖️ **Último sorteio:** {stats['pares_sorteio']} pares e {stats['impares_sorteio']} ímpares")
-                insights.append(f"🔢 **Seus jogos tendem a:** {stats['pares']/len(all_numbers)*100:.1f}% pares")
-            
-            for insight in insights:
-                st.markdown(f"<div class='stat-item'>{insight}</div>", unsafe_allow_html=True)
-            
-            st.markdown('</div>', unsafe_allow_html=True)
-            
-            # Estatísticas comparativas
-            st.markdown("---")
-            st.markdown('<div class="content-card">', unsafe_allow_html=True)
-            st.markdown("### 📊 ESTATÍSTICAS COMPARATIVAS")
-            
-            stats = calculate_advanced_stats(games_df, winning_numbers)
-            
-            # Comparação entre jogos e último sorteio
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.markdown("#### 🎮 Estatísticas dos Seus Jogos")
-                st.markdown(f"""
-                <div class="stat-item">📊 <strong>Pares:</strong> {stats['pares']} | <strong>Ímpares:</strong> {stats['impares']}</div>
-                <div class="stat-item">🔢 <strong>Primos:</strong> {stats['primos']} | <strong>Fibonacci:</strong> {stats['fibonacci']}</div>
-                <div class="stat-item">🖼️ <strong>Moldura:</strong> {stats['moldura']} | <strong>Centro:</strong> {stats['centro']}</div>
-                <div class="stat-item">➕ <strong>Soma Total:</strong> {stats['soma_total']} | <strong>Média:</strong> {stats['media']:.1f}</div>
-                """, unsafe_allow_html=True)
-            
-            with col2:
-                st.markdown("#### 🎲 Estatísticas do Último Sorteio")
-                if 'pares_sorteio' in stats:
-                    st.markdown(f"""
-                    <div class="stat-item">📊 <strong>Pares:</strong> {stats['pares_sorteio']} | <strong>Ímpares:</strong> {stats['impares_sorteio']}</div>
-                    <div class="stat-item">🔢 <strong>Primos:</strong> {stats['primos_sorteio']} | <strong>Fibonacci:</strong> {stats['fibonacci_sorteio']}</div>
-                    <div class="stat-item">🖼️ <strong>Moldura:</strong> {stats['moldura_sorteio']} | <strong>Centro:</strong> {stats['centro_sorteio']}</div>
-                    <div class="stat-item">➕ <strong>Soma:</strong> {stats['soma_sorteio']}</div>
-                    """, unsafe_allow_html=True)
+                # Estatísticas da planilha
+                st.markdown("### 📊 ESTATÍSTICAS DA PLANILHA")
+                st.write(f"**Total de registros:** {len(df)}")
+                st.write(f"**Colunas:** {list(df.columns)}")
+                if 'CONCURSO' in df.columns:
+                    st.write(f"**Concursos:** {df['CONCURSO'].min()} a {df['CONCURSO'].max()}")
             
             st.markdown('</div>', unsafe_allow_html=True)
     
     # Rodapé moderno
     st.markdown("---")
-    st.markdown("""
+    st.markdown(f"""
     <div style="text-align: center; padding: 2rem; background: linear-gradient(135deg, rgba(102, 51, 153, 0.1) 0%, rgba(255, 215, 0, 0.1) 100%); border-radius: 20px; margin: 2rem 0;">
         <h3 style="color: #ffd700; margin-bottom: 1rem;">🎯 LOTOFÁCIL DASHBOARD</h3>
         <p style="color: #9966cc; margin-bottom: 0.5rem;">Desenvolvido com tecnologia avançada • Streamlit & Plotly</p>
-        <p style="color: rgba(255,255,255,0.7);">Última atualização: {}</p>
+        <p style="color: rgba(255,255,255,0.7);">Última atualização: {datetime.datetime.now().strftime("%d/%m/%Y às %H:%M")}</p>
         <div style="width: 100px; height: 2px; background: linear-gradient(90deg, #ffd700, #663399); margin: 15px auto; border-radius: 1px;"></div>
     </div>
-    """.format(datetime.datetime.now().strftime("%d/%m/%Y às %H:%M")), unsafe_allow_html=True)
+    """, unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
-
-
-
 
 
 
